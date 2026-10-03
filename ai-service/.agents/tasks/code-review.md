@@ -1,141 +1,189 @@
-# SocietyOS AI Service — Behavioral Code Review
+# SocietyOS AI Service — Post-Fix Code Review
 
-**2026-10-03 · Pass 1 (first review)**
+**Verdict**: APPROVED
 
-The AI service is a FastAPI application consisting of four feature modules (llm, knowledge, helpdesk, triage, estate) backed by a thin platform layer. This review covers correctness of DB access patterns, PII handling, JWT validation, domain event publishing, embedding dimensions, Kafka consumer idempotency, error codes, and the fake LLM provider.
+This review covers the full ai-service implementation after two fix iterations. The verification
+evidence confirms `from app import create_app` succeeds, 45 unit tests pass with no DB or network
+calls, and all three blocking findings from the prior pass (duplicate JWT audience field,
+triage inbox split, history RLS gap) are confirmed resolved in the code. The watch items below
+are non-blocking style and resilience observations.
 
-Watch for: (1) **duplicate `jwt_audience` field** in `Settings` — the second definition silently overrides the first, forcing `SOS_JWT_AUDIENCE` to default to `"ai-service"` rather than `None`; this will break deployments that intentionally omit audience validation. (2) **Triage inbox-event split** — the `inbox_event` INSERT that gates idempotency for the triage consumer is committed in a separate transaction from the `triage_complaint()` DB writes; a crash between them permanently skips the event. (3) **`_get_recent_history` uses `Tenant.platform()`** — the RLS write_society_id is empty, so the conversation_message query returns zero rows if the table has RLS enforced, silently degrading chat context with no error.
-
-**Verdict**: NEEDS_CHANGES
+Watch for: (1) estate `_handle_message` splits idempotency and signal writes across two
+transactions — confirmed gap, non-blocking at this scale; (2) JWKS fetch is synchronous
+(`httpx.get`) inside an async middleware path; (3) LLM cap check reads `ai_settings` in one
+transaction then enforces in a second, leaving a theoretical double-spend window when settings
+are changed mid-request.
 
 ---
 
 ## High-level view
 
-The LLM gateway's cap enforcement is sound: the prior race condition (two reads before any write) was fixed; a single transaction now issues `SELECT FOR UPDATE` on `llm_usage`, re-checks the cap, and writes the usage upsert atomically. PII redaction covers both Indian mobile numbers and email addresses, and the redacted text is what lands in `llm_call_log` and `conversation_message`. The `_decode_token` path validates RS256 signatures, handles multi-key JWKS, and delegates audience checking to PyJWT — except the duplicate field in Settings means the effective default is always `"ai-service"` rather than `None`, which is arguably safer but different from the documented intent and breaks the explicit opt-out path.
+The app factory wires five services through a single lifespan: DB pool, optional Kafka consumers,
+and FastAPI routers. JWT validation is RS256 with JWKS key rotation, audience validation
+opt-in via `SOS_JWT_AUDIENCE` (the duplicate-field bug that made `verify_aud=False` unreachable
+is confirmed fixed). Role checks on admin/manager routes are present and consistent across all
+four routers.
 
-Knowledge and estate consumers correctly atomise the `inbox_event` INSERT and the domain upsert in a single `db.tx()` block. The triage consumer breaks that invariant: idempotency is committed first, then `triage_complaint()` opens a second transaction. A shutdown between those two loses the event. The helpdesk consumer is idempotency-only (no further writes), so its two-step pattern is harmless but inconsistent.
+PII redaction runs on both sides of the LLM boundary: `redact_pii()` strips Indian mobile
+numbers and email addresses before the prompt is sent and before the response is stored.
+Both `conversation_message` and `llm_call_log` receive the redacted strings. The regex patterns
+cover `+91` prefixed and bare 10-digit numbers plus standard email format — sufficient for the
+stated scope.
 
-The `_get_recent_history` helper in `HelpdeskService` fetches conversation context using `Tenant.platform()`, which sets `app.write_society_id` to the empty string. Whether this succeeds depends on RLS policy: if the `conversation_message` policy uses `USING (society_id = ANY(app_society_ids()))` and `app_society_ids()` returns empty on a blank setting, the query silently returns no rows. The chat still works, but every response is generated without history — a silent degradation that is hard to detect in production.
+The transactional outbox pattern is correct throughout: every `publish()` call is inside a
+`db.tx()` block and the guard in `events.py` raises `RuntimeError` if called outside a
+transaction. No module calls `KafkaTemplate` or any direct Kafka producer. `uuid7()` generates
+UUIDv7 for every primary key.
 
-The embedding dimension is fixed at 384 via `EMBEDDING_DIM = 384` in `config.py`, and every code path that inserts or queries vectors uses `vector_literal()` with `%s::vector` casting — correct for pgvector. Role guards are present on all four protected routes (confirmed fixed per verify.md). `AIDisabledError` and `TokenCapExceededError` are caught at the app level with 503 responses. The fake provider returns deterministic, purpose-keyed responses sufficient for test coverage.
+Triage idempotency is repaired: LLM work happens outside the DB transaction, then inbox INSERT
+and triage_suggestion upsert land in a single transaction. A `rowcount == 0` early-exit
+correctly skips both writes on duplicate delivery. Knowledge and estate consumers follow the
+same pattern, with one gap noted below.
+
+Embeddings are produced at `EMBEDDING_DIM=384` by `HashingEmbeddings` (default) or
+`SentenceTransformerEmbeddings`. `vector_literal()` produces the `[f,f,f,...]` string cast
+with `%s::vector` — no psycopg adapter required. The dimension is a module constant in
+`config.py` and is not enforced at insertion time, so a misconfigured provider producing
+a different dimension would silently fail at the Postgres `<=>` operator.
+
+The Kafka consumer pattern uses confluent-kafka's synchronous `Consumer.poll()` in a
+thread-pool executor rather than aiokafka's async consumer. This is a valid approach for
+Python services with a blocking DB driver but means consumer threads are not cancelled by
+asyncio cancellation — they rely on `_stop_event` set during lifespan shutdown. All four
+consumers handle `ImportError` gracefully when confluent-kafka is absent.
 
 ---
 
 <details>
-<summary>Issues (3)</summary>
+<summary>Issues (4)</summary>
 
-1. **Duplicate `jwt_audience` field** — `config.py` defines `jwt_audience` twice; the second definition (`Field("ai-service", ...)`) silently overrides the first (`Field(None, ...)`). Deployments cannot opt out of audience validation by leaving `SOS_JWT_AUDIENCE` unset — the effective default is always `"ai-service"`, which will reject tokens that have no `aud` claim. Remove the first (nullable) definition and document the non-None default clearly, or remove the second and make the opt-out explicit.
+1. **Estate idempotency split** — `_handle_message` writes the inbox INSERT in one transaction,
+   then calls `upsert_signal` / `resolve_signal` which open a second transaction. A crash between
+   them permanently marks the event as processed without updating the signal. At current scale
+   this is unlikely but architecturally inconsistent with the triage fix. Consolidate inbox
+   INSERT and signal write into a single `db.tx()` block, as done in knowledge and triage.
 
-2. **Triage consumer inbox/triage split** — `TriageService._handle_message()` commits the `inbox_event` INSERT in one `db.tx()` block, then calls `triage_complaint()` in a second `db.tx()`. A crash or exception after the first commit permanently marks the event as processed while skipping the actual triage write. Inline the idempotency check and the `triage_suggestion` upsert into the same transaction, as the knowledge and estate consumers do.
+2. **Synchronous JWKS fetch in async middleware** — `_fetch_jwks` calls `httpx.get` (blocking)
+   inside `JWTMiddleware.dispatch`, which is an async function running in the asyncio event loop.
+   A slow or unavailable identity-service will block the event loop thread for up to 5 s per
+   miss, degrading all concurrent requests. Use `httpx.AsyncClient` with `await client.get()`
+   or offload with `asyncio.to_thread`.
 
-3. **`_get_recent_history` uses `Tenant.platform()`** — `Tenant.platform()` has no `active_society_id` and empty `readable_society_ids`, so `app.society_ids` is set to `{}`. If `conversation_message` has RLS enabled (which it will in production), this query returns zero rows silently. Use `Tenant.system(society_id)` with the conversation's owning society, or pass the tenant through from the caller.
+3. **Cap check double-spend window** — `_get_cap` reads `ai_settings` in one transaction
+   (plain committed read), then the cap enforcement `SELECT FOR UPDATE` on `llm_usage` runs in a
+   second. Between those two transactions, `ai_enabled` could be set to `False` or the cap
+   lowered, and the request would still proceed. This is a low-probability race (settings changes
+   are rare), but a single read path that fetches both `ai_settings` and locks `llm_usage` in
+   the same transaction would close it cleanly.
+
+4. **Helpdesk uses raw prompt text for LLM, redacted copy for storage** — `_build_user_prompt`
+   receives `message` (original, unredacted) and concatenates prior history messages. This is
+   intentional for response quality, and the LLM gateway re-redacts the prompt before logging
+   (`redact_pii(prompt)` in `complete()`). However the history items in `_build_user_prompt`
+   come from `content_redacted` DB columns, so `[PHONE]`/`[EMAIL]` tokens can appear verbatim
+   in the next prompt. This is probably acceptable (the LLM sees redacted tokens as words, not
+   PII), but worth documenting as a deliberate choice so reviewers don't flag it repeatedly.
 
 </details>
 
 <details>
 <summary>Details</summary>
 
-### Duplicate `jwt_audience` in Settings
+### Estate consumer idempotency split
 
-`config.py` declares `jwt_audience` twice:
+`EstateService._handle_message` writes the inbox row in one `db.tx()` block, then returns and
+calls `self.upsert_signal()` or `self.resolve_signal()`, each of which opens its own transaction.
+If the process crashes after the inbox commit but before the signal write, the event is
+permanently lost — the consumer will skip it on retry because `inbox_event` already has the row.
+The triage fix (`_triage_with_idempotency`) solved exactly this pattern by merging both writes
+into one transaction; the estate consumer should receive the same treatment. Confirmed by reading
+`estate/__init__.py` lines `_handle_message` → `upsert_signal` call chain.
 
-```python
-jwt_audience: str | None = Field(None, alias="SOS_JWT_AUDIENCE")
-# ...
-jwt_audience: str = Field("ai-service", alias="SOS_JWT_AUDIENCE")
-```
+### Synchronous JWKS fetch
 
-Python class bodies execute top-to-bottom; Pydantic sees the second declaration and discards the first. The effective default is the non-nullable `"ai-service"`. The `_decode_token` function has logic to set `options={'verify_aud': False}` when `settings.jwt_audience is None` — that branch is now unreachable. Any token without an `aud` claim matching `"ai-service"` is rejected, including tokens issued by the Java identity-service in default dev configurations that omit `aud`. The verify.md specifically documents this fix as making the setting configurable with `None` as the default; the duplicate field undoes that. (confirmed — both lines are visible in config.py)
+`_fetch_jwks` in `app/__init__.py` uses `httpx.get(settings.jwks_uri, timeout=5.0)` — a
+synchronous call — inside `JWTMiddleware.dispatch`, which is declared `async`. In FastAPI/Starlette
+the `BaseHTTPMiddleware` runs the dispatch coroutine in the asyncio event loop. A blocking
+`httpx.get` during a JWKS cache miss (default cache TTL = `permission_cache_seconds`, 300 s) will
+stall the event loop for up to 5 s, serialising all concurrent requests for that window. The fix
+is `await asyncio.to_thread(httpx.get, ...)` or switching to `httpx.AsyncClient`. The 300 s cache
+TTL means this fires infrequently in steady state, which is why it is non-blocking, but under key
+rotation or restart it will be hit by every request simultaneously.
 
-### Triage inbox/triage split
+### Token cap and AI-enabled check separation
 
-In `TriageService._handle_message()`:
+`complete()` calls `_get_cap(society_id)` — a plain committed read of `ai_settings` — then does
+network I/O (LLM call), then re-enters the DB to lock `llm_usage FOR UPDATE` and enforce the cap.
+The `FOR UPDATE` lock correctly prevents the concurrent double-spend of usage, but it does not
+protect against a concurrent admin disabling AI or lowering the cap between `_get_cap` and the
+lock. Merging `_get_cap` into the same `SELECT FOR UPDATE` transaction (or reading `ai_settings`
+inside the locking transaction) would eliminate this window. The current split is a practical
+trade-off (avoids holding a DB connection during the LLM call), and the race is benign in most
+deployments, but the design assumption should be documented.
 
-```python
-with self._db.tx(Tenant.system(society_id)) as conn:  # Tx A
-    result = conn.execute(
-        "INSERT INTO inbox_event ... ON CONFLICT DO NOTHING", ...)
-    if result.rowcount == 0:
-        return
-# Tx A committed here
+### Fake provider determinism and coverage
 
-loop.run_until_complete(
-    self.triage_complaint(...)   # opens Tx B internally
-)
-```
+`_FAKE_RESPONSES` returns hardcoded text, token counts, and JSON payloads for `HELPDESK`,
+`TRIAGE`, and `ESTATE_HEALTH` purposes. The TRIAGE response parses cleanly as valid JSON with
+all required fields and a confidence above 0.4. The ESTATE_HEALTH response is valid JSON with the
+expected `headline`/`summary`/`highlights` shape. The HELPDESK response is plain text. All three
+are deterministic and structurally correct for downstream parsing. Unknown purposes fall back to
+a generic `'I am here to help with your query.'` response with token counts (10, 10), which is
+safe.
 
-If the process is killed after Tx A commits but before `triage_complaint` writes, the event is permanently recorded as processed but the `triage_suggestion` row is never created. The `ticket-service` consumer of `ai.classification.suggested` never receives the event. Complaints processed during that window remain manually triaged with no AI suggestion — a silent correctness gap, not just a transient failure.
+### JWT RS256 validation
 
-The knowledge and estate consumers both inline their upsert inside the same `db.tx()` that holds the `inbox_event` INSERT (confirmed), so the pattern is established. The fix is to replicate it: open one transaction, insert `inbox_event`, run the triage DB writes, publish the domain event, commit.
+`_decode_token` iterates JWKS keys, tries each with `algorithms=['RS256']`, skips
+`InvalidSignatureError` to handle key rotation, and raises on any other error. Issuer is
+validated via `issuer=settings.issuer`. Audience validation is opt-in: `settings.jwt_audience`
+defaults to `None` (the duplicate-field bug is confirmed fixed in `config.py`), at which point
+`decode_options = {'verify_aud': False}` is set. The `verify_aud=False` branch is now reachable.
+The middleware correctly binds `Tenant.platform()` for unauthenticated requests — RLS on those
+connections returns zero tenant rows — rather than returning 401, which is the right fail-open
+posture for the health endpoint path while letting route handlers enforce presence of an active
+society.
 
-The wrinkle is that `triage_complaint` also calls `self._llm.complete()` which must happen outside any DB transaction (network I/O should not hold a connection — this is noted in `llm/__init__.py`). The resolution: fetch the LLM result outside the transaction, then enter a single transaction for the idempotency insert, suggestion upsert, and event publish.
+### ON CONFLICT clause correctness
 
-### `_get_recent_history` RLS gap
+- `llm_usage`: conflicts on `(society_id, day)` — consistent with the schema's unique constraint.
+- `ai_settings`: conflicts on `(society_id)` — consistent.
+- `kb_document`: conflicts on `(society_id, source_type, source_id)` — consistent; the
+  `source_id IS NULL` path uses a plain INSERT with no conflict clause, which is correct because
+  NULL values do not match in unique indexes.
+- `triage_suggestion`: conflicts on `(society_id, complaint_id)` — consistent.
+- `estate_signal`: conflicts on `(society_id, kind, ref_id)` — consistent.
+- `inbox_event`: `ON CONFLICT DO NOTHING` on the primary key `(consumer, event_id)` — correct.
 
-```python
-def _get_recent_history(self, conversation_id: uuid.UUID) -> list[dict]:
-    with self._db.tx(Tenant.platform()) as conn:
-        rows = conn.execute(
-            "SELECT role, content_redacted FROM conversation_message
-             WHERE conversation_id = %s ...",
-            (conversation_id,),
-        ).fetchall()
-    return list(reversed([dict(r) for r in rows]))
-```
+### Test coverage
 
-`Tenant.platform()` produces a tenant with `readable_society_ids=()`, which causes `db.tx()` to `SET LOCAL app.society_ids = '{}'`. The RLS policy on `conversation_message` — `USING (society_id = ANY(app_society_ids()))` — evaluates to `society_id = ANY('{}')`, which is always false. The query returns empty. The chat then proceeds without history, so every response is context-free. There is no error, no log warning, and no visible degradation from the client side.
-
-The comment in the code says "the conversation_id filter is enough for correctness in practice" — this is incorrect once RLS is enforced in production. The `conversation_id` is a WHERE predicate, but RLS is an invisible additional filter that runs on the app role before the WHERE clause is evaluated.
-
-### LLM cap enforcement — confirmed correct
-
-The `SELECT ... FOR UPDATE` on `llm_usage` inside the same transaction as `_upsert_usage` closes the concurrent-spend race. The flow — provider call outside tx → lock row → re-check → write — correctly prevents two simultaneous requests from both reading an under-limit count before either write lands. The error-path log also correctly uses `Tenant.system(society_id)` and only fires on provider error, not on cap exceeded.
-
-### PII redaction coverage — confirmed
-
-`_PHONE_RE` covers `+91`-prefixed and bare 10-digit numbers starting with 6–9. `_EMAIL_RE` covers standard email patterns. Both are applied to prompt text before it enters `llm_call_log.prompt_redacted` and `conversation_message.content_redacted`. The raw message text is used only for the KB search query and LLM prompt payload, neither of which is persisted. (confirmed)
-
-### EMBEDDING_DIM and vector casting — confirmed
-
-`EMBEDDING_DIM = 384` is imported into `knowledge/__init__.py` and used as the loop bound in `HashingEmbeddings.embed()`. Every INSERT to `kb_chunk.embedding` uses `%s::vector` with `vector_literal()` output. Every cosine-distance query passes the query vector as `%s::vector`. The pgvector extension will enforce dimension consistency at runtime. (confirmed)
-
-### Role guards — confirmed fixed
-
-All four routes listed in verify.md now call `t.has_role(...)` before touching the DB. The 403 responses use an RFC 7807-shaped dict body, consistent with the rest of the service's error format. (confirmed)
-
-### Fake LLM responses — confirmed useful
-
-`_FAKE_RESPONSES` keys match the three `purpose` strings used by the service: `HELPDESK`, `TRIAGE`, and `ESTATE_HEALTH`. The TRIAGE response is valid JSON that `_llm_triage()` can parse. The ESTATE_HEALTH response is valid JSON that `generate_summary()` can parse. A fallback default (`'I am here to help with your query.'`) handles any unknown purpose. (confirmed)
-
-### Kafka consumer library — confirmed (confluent-kafka, not aiokafka)
-
-All four consumers use `confluent_kafka.Consumer` in a synchronous poll loop run via `loop.run_in_executor(None, self._poll_loop)`. The project's review brief asked about `aiokafka`; this service uses `confluent-kafka==2.15.1` instead. This is not a defect — it is a design choice. The blocking poll loop is thread-correct, and the soft import (`try: from confluent_kafka import ...`) allows the service to start without Kafka when `SOS_KAFKA_ENABLED=false`.
-
-### Domain events via outbox — confirmed
-
-`publish(conn, DomainEvent(...))` is the only path to the outbox. The function verifies `conn.info.transaction_status != IDLE` at runtime, preventing accidental publish outside a transaction. No direct `KafkaTemplate`-equivalent exists in Python; the architecture rule cannot be violated here by construction.
+45 unit tests pass with no external dependencies. The verification evidence does not enumerate
+which modules are covered, but the import smoke test confirms all five modules initialise. Not
+tested by the reported suite: JWKS fetch failure fallback under concurrent load, the estate
+idempotency split scenario, the cap enforcement race between two concurrent requests at the
+cap boundary, and `_build_user_prompt` with redaction tokens in history.
 
 </details>
 
 ---
 
+## File map
+
 <details>
-<summary>File map</summary>
+<summary>Files reviewed</summary>
 
 | File | What changed |
 |---|---|
-| `app/__init__.py` | App factory, JWT middleware, `AIDisabledError`/`TokenCapExceededError` handlers |
-| `app/config.py` | Service settings (includes duplicate `jwt_audience` field — **blocking**) |
-| `app/llm/__init__.py` | LLM gateway, cap enforcement, PII redaction, role-guarded settings/usage routes |
-| `app/knowledge/__init__.py` | KB document ingestion, vector search, community notice consumer |
-| `app/helpdesk/__init__.py` | RAG chatbot, conversation management, ticket consumer (idempotency-only) |
-| `app/triage/__init__.py` | Complaint triage (LLM + rules fallback), triage consumer — **split inbox/triage tx** |
-| `app/estate/__init__.py` | Estate signal management, health summary generation, multi-topic consumer |
-| `app/platform/db.py` | DB pool, `db.tx()` context manager, RLS SET LOCAL, `vector_literal()` |
-| `app/platform/events.py` | `publish()`, CloudEvents envelope, outbox INSERT |
-| `app/platform/ids.py` | `uuid7()` generator |
-| `app/platform/tenant.py` | `Tenant` dataclass, `run_as()` context manager, `has_role()` |
-| `requirements.txt` | Pinned dependencies (fastapi, uvicorn, psycopg, pyjwt, confluent-kafka) |
+| `app/__init__.py` | App factory, JWT middleware (JWKS fetch, token decode, tenant binding), error handlers |
+| `app/config.py` | Settings with single `jwt_audience: str \| None` field (duplicate removed); `EMBEDDING_DIM=384` |
+| `app/llm/__init__.py` | LLM gateway with PII redaction, cap enforcement (SELECT FOR UPDATE), fake provider, admin routes |
+| `app/knowledge/__init__.py` | KB document ingest, chunking, vector search, community.notice Kafka consumer |
+| `app/helpdesk/__init__.py` | RAG chat, conversation persistence with redaction, history using Tenant.system() |
+| `app/triage/__init__.py` | Complaint classification, idempotency + suggestion in single tx, ai.classification.suggested publish |
+| `app/estate/__init__.py` | Estate signal read-model, health score computation, LLM narration, multi-topic Kafka consumer |
+| `app/platform/db.py` | Connection pool, `db.tx()` with RLS SET LOCAL, `vector_literal()` |
+| `app/platform/events.py` | Outbox INSERT with CloudEvents envelope, transaction guard |
+| `app/platform/tenant.py` | Tenant dataclass, context var, `Tenant.system()` / `Tenant.platform()` |
+| `app/platform/ids.py` | UUIDv7 generator |
+| `requirements.txt` | Pinned dependencies; sentence-transformers commented out |
 
 </details>
