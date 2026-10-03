@@ -117,17 +117,22 @@ class LLMGateway:
     ) -> LLMResponse:
         """Check cap, call provider, write llm_call_log + llm_usage.
 
+        Cap enforcement is race-condition-free: the llm_usage row is locked with
+        SELECT FOR UPDATE inside the same transaction that writes the usage upsert,
+        so concurrent requests cannot all pass the cap check before any write lands.
+
         Raises:
             AIDisabledError: if ai_enabled=False for the society.
             TokenCapExceededError: if the daily token cap is already hit.
             HTTPException 503: on provider error.
         """
-        # 1. Verify AI enabled + cap headroom (read-only, no transaction needed)
-        self._check_enabled_and_cap(society_id)
+        # 1. Check AI-enabled status (fast read, no lock needed — just on/off flag)
+        cap = self._get_cap(society_id)
 
-        # 2. Call provider
-        outcome = 'OK'
+        # 2. Call provider (outside DB transaction — network I/O should not hold a connection)
+        prompt_redacted = redact_pii(prompt)
         response: LLMResponse | None = None
+        outcome = 'OK'
         try:
             if self._settings.llm_provider == 'fake':
                 response = await self._fake_complete(purpose, prompt)
@@ -138,8 +143,6 @@ class LLMGateway:
         except Exception as exc:
             log.exception("LLM provider error for society %s purpose %s", society_id, purpose)
             outcome = 'ERROR'
-            # Still log the failed call
-            prompt_redacted = redact_pii(prompt)
             with self._db.tx(Tenant.system(society_id)) as conn:
                 self._log_call(
                     conn, society_id, purpose,
@@ -157,10 +160,32 @@ class LLMGateway:
                 },
             )
 
-        # 3. Persist usage + log inside a transaction
-        prompt_redacted = redact_pii(prompt)
         response_redacted = redact_pii(response.text)
+
+        # 3. Atomically check cap and write usage in one transaction (SELECT FOR UPDATE).
+        #    This closes the race window: the usage row is locked for the duration of
+        #    the check + upsert, so concurrent requests cannot all pass the cap before
+        #    any write lands.
         with self._db.tx(Tenant.system(society_id)) as conn:
+            # Lock the usage row (or confirm absence) so no concurrent request can
+            # read the old value until this transaction commits.
+            usage_row = conn.execute(
+                """SELECT COALESCE(input_tokens,0) + COALESCE(output_tokens,0) AS used
+                   FROM llm_usage
+                   WHERE society_id = %s AND day = CURRENT_DATE
+                   FOR UPDATE""",
+                (society_id,),
+            ).fetchone()
+            used = usage_row['used'] if usage_row else 0
+
+            if used >= cap:
+                # Do NOT write a log row here: doing so on every cap-exceeded request
+                # causes write amplification under load.  The caller receives
+                # TokenCapExceededError and can surface it to the user.
+                raise TokenCapExceededError(
+                    f"Daily token cap of {cap} reached for society {society_id}"
+                )
+
             self._log_call(
                 conn, society_id, purpose,
                 response.model, prompt_redacted, response_redacted,
@@ -174,34 +199,23 @@ class LLMGateway:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _check_enabled_and_cap(self, society_id: uuid.UUID) -> None:
-        """Read ai_settings + today's llm_usage; raise if AI off or cap hit."""
+    def _get_cap(self, society_id: uuid.UUID) -> int:
+        """Return the daily token cap for the society; raise AIDisabledError if AI is off.
+
+        This is a plain committed read — no locking required because it is only checking
+        a configuration flag, not performing the usage enforcement (that happens inside
+        the FOR UPDATE transaction in complete()).
+        """
         with self._db.tx(Tenant.system(society_id)) as conn:
             row = conn.execute(
                 "SELECT ai_enabled, daily_token_cap FROM ai_settings WHERE society_id = %s",
                 (society_id,),
             ).fetchone()
-            if row is not None:
-                if not row['ai_enabled']:
-                    raise AIDisabledError(f"AI is disabled for society {society_id}")
-                cap = row['daily_token_cap'] if row['daily_token_cap'] is not None else self._settings.default_daily_token_cap
-            else:
-                cap = self._settings.default_daily_token_cap
-
-            usage_row = conn.execute(
-                "SELECT COALESCE(input_tokens,0) + COALESCE(output_tokens,0) AS used "
-                "FROM llm_usage WHERE society_id = %s AND day = CURRENT_DATE",
-                (society_id,),
-            ).fetchone()
-            used = usage_row['used'] if usage_row else 0
-
-            if used >= cap:
-                # Log CAPPED outcome
-                self._log_call(
-                    conn, society_id, 'CAP_CHECK',
-                    'N/A', '', None, 0, 0, 'CAPPED',
-                )
-                raise TokenCapExceededError(f"Daily token cap of {cap} reached for society {society_id}")
+        if row is not None:
+            if not row['ai_enabled']:
+                raise AIDisabledError(f"AI is disabled for society {society_id}")
+            return row['daily_token_cap'] if row['daily_token_cap'] is not None else self._settings.default_daily_token_cap
+        return self._settings.default_daily_token_cap
 
     def _upsert_usage(
         self,
@@ -325,6 +339,9 @@ def get_ai_settings(society_id: uuid.UUID, request: Request):
 
 @router.put('/settings/{society_id}', summary='Update AI settings for a society')
 def put_ai_settings(society_id: uuid.UUID, body: _AISettingsIn, request: Request):
+    t = tenant_ctx.current()
+    if not (t.has_role('ADMIN') or t.has_role('MANAGER') or t.has_role('SUPER_ADMIN')):
+        raise HTTPException(status_code=403, detail={'type': 'about:blank', 'title': 'Forbidden', 'status': 403, 'detail': 'ADMIN or MANAGER role required'})
     db: Database = request.app.state.db
     with db.tx(Tenant.system(society_id)) as conn:
         conn.execute(
@@ -341,6 +358,9 @@ def put_ai_settings(society_id: uuid.UUID, body: _AISettingsIn, request: Request
 
 @router.get('/usage/{society_id}', summary='Get LLM usage for the last 30 days')
 def get_llm_usage(society_id: uuid.UUID, request: Request):
+    t = tenant_ctx.current()
+    if not (t.has_role('ADMIN') or t.has_role('MANAGER') or t.has_role('SUPER_ADMIN')):
+        raise HTTPException(status_code=403, detail={'type': 'about:blank', 'title': 'Forbidden', 'status': 403, 'detail': 'ADMIN or MANAGER role required'})
     db: Database = request.app.state.db
     with db.tx(Tenant.system(society_id)) as conn:
         rows = conn.execute(

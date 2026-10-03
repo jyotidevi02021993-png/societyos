@@ -184,8 +184,20 @@ def _fetch_jwks(settings: Settings) -> list[dict]:
 
 
 def _decode_token(token: str, settings: Settings) -> dict:
-    """Decode and verify an RS256 JWT.  Returns the claims dict."""
+    """Decode and verify an RS256 JWT.  Returns the claims dict.
+
+    Audience validation: if settings.jwt_audience is set (recommended for multi-service
+    deployments sharing a JWKS endpoint), the token's 'aud' claim must contain that value.
+    If unset, audience validation is skipped — tokens from any audience signed by the same
+    key are accepted (acceptable only in single-service or dev deployments).
+    """
     keys = _fetch_jwks(settings)
+
+    # Build decode options
+    decode_options: dict = {}
+    audience = settings.jwt_audience  # None → skip aud check
+    if audience is None:
+        decode_options['verify_aud'] = False
 
     # Try each key in the JWKS
     last_exc: Exception | None = None
@@ -196,7 +208,8 @@ def _decode_token(token: str, settings: Settings) -> dict:
                 token,
                 public_key,
                 algorithms=['RS256'],
-                options={'verify_aud': False},
+                options=decode_options,
+                audience=audience,
                 issuer=settings.issuer,
             )
             return claims

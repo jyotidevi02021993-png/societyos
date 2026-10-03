@@ -503,6 +503,8 @@ def get_categories(request: Request):
 def post_category(body: _CategoryIn, request: Request):
     svc: TriageService = _triage_svc(request)
     t = tenant_ctx.current()
+    if not (t.has_role('ADMIN') or t.has_role('MANAGER') or t.has_role('SUPER_ADMIN')):
+        raise HTTPException(status_code=403, detail={'type': 'about:blank', 'title': 'Forbidden', 'status': 403, 'detail': 'ADMIN or MANAGER role required'})
     society_id = t.require_active_society()
     cat_id = svc.create_category(
         society_id=society_id,

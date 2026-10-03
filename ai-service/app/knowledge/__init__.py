@@ -378,15 +378,6 @@ class KnowledgeService:
 
         data = payload.get('data', payload)
 
-        with self._db.tx(Tenant.system(society_id)) as conn:
-            # Idempotency check
-            result = conn.execute(
-                "INSERT INTO inbox_event (consumer, event_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                ('ai-knowledge', event_id),
-            )
-            if result.rowcount == 0:
-                return  # already processed
-
         notice_id_str = data.get('noticeId') or data.get('id')
         title = data.get('title', 'Untitled Notice')
         content = data.get('content') or data.get('body', '')
@@ -394,13 +385,59 @@ class KnowledgeService:
             return
 
         notice_id = uuid.UUID(notice_id_str) if notice_id_str else None
-        self.ingest_document(
-            society_id=society_id,
-            source_type='NOTICE',
-            source_id=notice_id,
-            title=title,
-            body=content,
-        )
+
+        # Idempotency check and document ingest are in the SAME transaction so a crash
+        # between them cannot leave a permanently-lost event.  If the inbox INSERT lands
+        # the document upsert is also committed; if either fails both roll back and the
+        # event is retried on the next poll.
+        audience_roles: list[str] = []
+        audience_tower_ids: list[uuid.UUID] = []
+
+        with self._db.tx(Tenant.system(society_id)) as conn:
+            result = conn.execute(
+                "INSERT INTO inbox_event (consumer, event_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                ('ai-knowledge', event_id),
+            )
+            if result.rowcount == 0:
+                return  # already processed
+
+            # Upsert document
+            if notice_id is not None:
+                row = conn.execute(
+                    """INSERT INTO kb_document
+                       (id, society_id, source_type, source_id, title, audience_roles, audience_tower_ids, status)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'ACTIVE')
+                       ON CONFLICT (society_id, source_type, source_id)
+                       DO UPDATE SET title = EXCLUDED.title, status = 'ACTIVE', updated_at = now()
+                       RETURNING id""",
+                    (uuid7(), society_id, 'NOTICE', notice_id, title,
+                     audience_roles, audience_tower_ids),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """INSERT INTO kb_document
+                       (id, society_id, source_type, source_id, title, audience_roles, audience_tower_ids, status)
+                       VALUES (%s, %s, %s, NULL, %s, %s, %s, 'ACTIVE')
+                       RETURNING id""",
+                    (uuid7(), society_id, 'NOTICE', title,
+                     audience_roles, audience_tower_ids),
+                ).fetchone()
+
+            doc_id: uuid.UUID = row['id']
+
+            # Delete old chunks (re-ingest)
+            conn.execute("DELETE FROM kb_chunk WHERE document_id = %s", (doc_id,))
+
+            # Create new chunks
+            chunks = chunk_text(content, self._settings.chunk_chars)
+            for ordinal, chunk_content in enumerate(chunks):
+                vec = self._embeddings.embed(chunk_content)
+                conn.execute(
+                    """INSERT INTO kb_chunk (id, society_id, document_id, ordinal, content, embedding)
+                       VALUES (%s, %s, %s, %s, %s, %s::vector)""",
+                    (uuid7(), society_id, doc_id, ordinal, chunk_content, vector_literal(vec)),
+                )
+
         log.info('Ingested notice %s for society %s', notice_id, society_id)
 
 

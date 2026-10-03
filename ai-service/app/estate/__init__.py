@@ -474,6 +474,9 @@ def _estate_svc(request: Request) -> EstateService:
 @router.post('/{society_id}/health', summary='Generate an estate health summary')
 async def generate_health(society_id: uuid.UUID, request: Request):
     svc: EstateService = _estate_svc(request)
+    t = tenant_ctx.current()
+    if not (t.has_role('ADMIN') or t.has_role('MANAGER') or t.has_role('SUPER_ADMIN')):
+        raise HTTPException(status_code=403, detail={'type': 'about:blank', 'title': 'Forbidden', 'status': 403, 'detail': 'ADMIN or MANAGER role required'})
     result = await svc.generate_summary(society_id=society_id)
     return {
         'summary_id': str(result.summary_id),
