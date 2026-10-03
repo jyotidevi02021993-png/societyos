@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "text": "Reply with exactly: SocietyOS AWS Bedrock is working."
+      }
+    ]
+  }
+]

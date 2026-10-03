@@ -1,0 +1,14 @@
+sos:
+  outbox:
+    polling-interval: 100
+  community:
+    due-poll: 1s
+spring:
+  kafka:
+    consumer:
+      properties:
+        metadata.max.age.ms: 1000
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

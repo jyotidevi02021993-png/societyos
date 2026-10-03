@@ -1,0 +1,7 @@
+sos:
+  outbox:
+    polling-interval: 100
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

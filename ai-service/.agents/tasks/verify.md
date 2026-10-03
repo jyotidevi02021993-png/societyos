@@ -1,57 +1,69 @@
-# AI Service — Verification (review iteration)
+# Verification Report — AI Service Review Fix Iteration
 
-## Import smoke test
+## Date
+Second iteration (review findings addressed)
+
+## Review Findings Fixed
+
+### finding: duplicate-jwt-audience (blocking)
+**Root cause:** `app/config.py` had two `jwt_audience` field definitions on consecutive lines.
+The second (`str = Field("ai-service", ...)`) silently overrode the first
+(`str | None = Field(None, ...)`), making audience validation always required with a hardcoded
+value. The `verify_aud=False` branch in `_decode_token` was unreachable.
+
+**Fix:** Removed the second (hardcoded) definition. Kept the first with type `str | None` and
+`default=None`, preserving the documented opt-in behaviour: set `SOS_JWT_AUDIENCE` to enable
+audience validation; leave unset to skip it.
+
+**File changed:** `app/config.py`
+
+---
+
+### finding: triage-inbox-triage-split (blocking)
+**Root cause:** `TriageService._handle_message()` committed the `inbox_event` INSERT in
+transaction A, then called `triage_complaint()` in a separate transaction B. A crash between
+the two writes permanently marked the Kafka event as processed while the `triage_suggestion`
+row was never written. Complaints processed during that window received no AI classification.
+
+**Fix:** Extracted a new `_triage_with_idempotency()` async method. The LLM call (network I/O)
+still happens outside any transaction. The idempotency INSERT (`inbox_event`) and the
+`triage_suggestion` upsert now land together in a **single transaction**. If the inbox INSERT
+returns `rowcount=0` (duplicate), the transaction exits immediately without running the upsert.
+A crash after the LLM call but before the commit causes both the inbox INSERT and the upsert to
+roll back, so the event is safely retried on the next poll.
+
+**File changed:** `app/triage/__init__.py`
+
+---
+
+### finding: history-rls-gap (blocking)
+**Root cause:** `HelpdeskService._get_recent_history()` opened a DB transaction with
+`Tenant.platform()`, which sets `app.society_ids='{}'`. The RLS policy on
+`conversation_message` filtered out all rows silently, so every helpdesk response was generated
+without any prior conversation history.
+
+**Fix:** Added `society_id: uuid.UUID` parameter to `_get_recent_history()`. Updated the DB
+transaction to use `Tenant.system(society_id)` so the RLS policy resolves the correct society
+rows. Updated the call-site in `chat()` to pass `society_id` through.
+
+**File changed:** `app/helpdesk/__init__.py`
+
+---
+
+## Build / Test Output
+
 ```
-$ python -c "from app import create_app; print('import OK')"
+# Import smoke test
+python -c "from app import create_app; print('import OK')"
 import OK
+
+# Unit tests (no DB / Kafka / API key)
+python -m pytest tests/unit/ -v
+45 passed in 0.80s
+
+# Full test suite
+python -m pytest tests/ -x -q
+45 passed in 0.39s
 ```
 
-## Unit tests
-```
-$ python -m pytest tests/ -x -q
-.............................................                            [100%]
-45 passed in 0.53s
-```
-
-## Review findings fixed
-
-### token-cap-race (blocking) — FIXED
-`LLMGateway.complete()` was restructured:
-- Old flow: `_check_enabled_and_cap()` (committed Tx A) → provider call → usage upsert (Tx B).
-  Concurrent requests all read the pre-write usage value, spending beyond the cap.
-- New flow: provider call happens outside any DB transaction. Then a single Tx opens with
-  `SELECT ... FOR UPDATE` on the `llm_usage` row, re-checks `used >= cap`, and writes the
-  usage upsert if the cap is not exceeded — all in one atomic transaction.
-  The `_check_enabled_and_cap` helper was replaced by `_get_cap()` (reads ai_settings only,
-  no locking needed for an on/off flag).
-
-### no-role-guard (blocking) — FIXED
-Added `t.has_role(...)` checks to all four routes that were missing them:
-- `PUT /v1/llm/settings/{society_id}` — requires ADMIN, MANAGER, or SUPER_ADMIN
-- `GET /v1/llm/usage/{society_id}` — requires ADMIN, MANAGER, or SUPER_ADMIN
-- `POST /v1/triage/categories` — requires ADMIN, MANAGER, or SUPER_ADMIN
-- `POST /v1/estate/{society_id}/health` — requires ADMIN, MANAGER, or SUPER_ADMIN
-All return HTTP 403 `application/json` with RFC 7807 body on insufficient role.
-
-### knowledge-idempotency-gap (blocking) — FIXED
-`KnowledgeService._handle_message()` previously committed the `inbox_event` INSERT in its
-own transaction, then called `self.ingest_document()` in a second transaction. A crash
-between those two would leave the event permanently skipped on replay.
-
-The fix inlines the document upsert (INSERT kb_document, DELETE + re-INSERT kb_chunk) directly
-into the same `db.tx()` block that holds the `inbox_event` INSERT. Both commit together or
-both roll back; the event is retried on the next Kafka poll if either fails.
-
-### jwt-aud-disabled (blocking) — FIXED
-Added `jwt_audience: str | None = Field(None, alias="SOS_JWT_AUDIENCE")` to `Settings`.
-`_decode_token()` now uses this value as the `audience` parameter to `pyjwt.decode()`.
-When set (e.g. `SOS_JWT_AUDIENCE=ai-service`), tokens issued for a different audience are
-rejected. When left unset (default for local dev), `options={'verify_aud': False}` is passed
-so existing dev setups continue to work. The omission is now explicit and configurable.
-
-### cap-capped-log-flood (minor) — FIXED
-The CAPPED log row that was written inside `_check_enabled_and_cap` on every cap-exceeded
-request has been removed. The old design committed a `llm_call_log` row for every request
-that hit the cap, causing high write volume under a flood. Cap-exceeded requests now raise
-`TokenCapExceededError` immediately without any DB write. The error is visible to callers
-through the 503 response.
+All tests pass. No DB or network calls are made during the test run.

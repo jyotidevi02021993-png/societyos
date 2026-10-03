@@ -1,0 +1,13 @@
+.git
+.maven-home
+.run-logs
+**/node_modules
+**/.next
+**/.venv
+**/target/**
+!services/*/target/
+!services/*/target/*.jar
+**/target/*-sources.jar
+**/target/*-javadoc.jar
+**/hs_err_pid*.log
+**/replay_pid*.log

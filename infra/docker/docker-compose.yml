@@ -1,0 +1,511 @@
+# Local infrastructure for SocietyOS (docs/architecture/10 Ãƒâ€šÃ‚Â§2).
+#
+#   docker compose -f infra/docker/docker-compose.yml up -d
+#   docker compose -f infra/docker/docker-compose.yml --profile cdc up -d   # + Debezium
+#
+# Services run from the IDE or with ./mvnw spring-boot:run in their folder. Without the
+# "cdc" profile, start services with SOS_OUTBOX_RELAY=polling.
+name: societyos
+
+x-app-defaults: &app-defaults
+  image: societyos-runtime:local
+  command: ["-jar", "/opt/app/app.jar"]
+  restart: unless-stopped
+  mem_limit: 448m
+  environment: &app-environment
+    JAVA_TOOL_OPTIONS: "-Xms24m -Xmx160m -XX:MaxMetaspaceSize=160m -XX:ReservedCodeCacheSize=48m -Xss512k"
+    SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "2"
+    CONFIG_SERVER_URL: http://config-server:8888
+    EUREKA_URL: http://service-registry:8761/eureka
+    KAFKA_BOOTSTRAP: kafka:29092
+    REDIS_HOST: redis
+    SOS_OUTBOX_RELAY: polling
+    SOS_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+    IDENTITY_URL: http://identity-service:8081
+    # Also in config-repo; set here too so Feign keeps TenantContext if config-server is unreachable at boot.
+    SPRING_CLOUD_CIRCUITBREAKER_RESILIENCE4J_DISABLETHREADPOOL: "true"
+  depends_on: &app-dependencies
+    app-runtime: { condition: service_started }
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    kafka: { condition: service_healthy }
+    kafka-init: { condition: service_completed_successfully }
+    service-registry: { condition: service_healthy }
+    config-server: { condition: service_healthy }
+    s3mock: { condition: service_started }
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:$${PORT}/actuator/health || exit 1"]
+    interval: 15s
+    timeout: 5s
+    retries: 20
+    start_period: 120s
+
+services:
+  app-runtime:
+    image: societyos-runtime:local
+    build:
+      context: ./runtime
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-c"]
+    command: ["while true; do sleep 3600; done"]
+    mem_limit: 32m
+    restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=30", "-c", "max_wal_senders=30"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.8.1
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:9093,HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics are created by kafka-init, as in prod
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      interval: 5s
+      retries: 30
+
+  kafka-init:
+    image: apache/kafka:3.8.1
+    depends_on:
+      kafka: { condition: service_healthy }
+    volumes:
+      - ./kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports: ["8180:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  connect:
+    profiles: ["cdc"]
+    image: quay.io/debezium/connect:2.7
+    ports: ["18083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: sos-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+
+  minio:
+    profiles: ["object-storage"]
+    image: quay.io/minio/minio:RELEASE.2025-10-15T17-29-55Z
+    command: server /data --console-address ":9001"
+    ports: ["9000:9000", "9001:9001"]
+    environment:
+      MINIO_ROOT_USER: societyos
+      MINIO_ROOT_PASSWORD: societyos-secret
+    volumes:
+      - minio:/data
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["1025:1025", "8025:8025"]
+
+  s3mock:
+    image: adobe/s3mock:4.7.0
+    restart: unless-stopped
+    ports: ["19000:9090"]
+
+  service-registry:
+    image: societyos-runtime:local
+    command: ["-jar", "/opt/app/app.jar"]
+    restart: unless-stopped
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms24m -Xmx160m -XX:MaxMetaspaceSize=112m -XX:ReservedCodeCacheSize=24m -Xss512k"
+      SERVICE: service-registry
+      PORT: "8761"
+      EUREKA_HOSTNAME: service-registry
+      EUREKA_PEER_AWARE: "false"
+    volumes:
+      - ../../services/service-registry/target/service-registry-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+    ports: ["18761:8761"]
+    depends_on:
+      app-runtime: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8761/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
+  config-server:
+    image: societyos-runtime:local
+    command: ["-jar", "/opt/app/app.jar"]
+    restart: unless-stopped
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xms24m -Xmx160m -XX:MaxMetaspaceSize=112m -XX:ReservedCodeCacheSize=24m -Xss512k"
+      SERVICE: config-server
+      PORT: "8888"
+      CONFIG_REPO: file:/config-repo/
+      EUREKA_URL: http://service-registry:8761/eureka
+    volumes:
+      - ../../config-repo:/config-repo:ro
+      - ../../services/config-server/target/config-server-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+    depends_on:
+      app-runtime: { condition: service_started }
+      service-registry: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8888/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    ports: ["18888:8888"]
+
+  api-gateway:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: api-gateway
+      PORT: "8080"
+    ports: ["18080:8080"]
+    volumes:
+      - ../../services/api-gateway/target/api-gateway-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  identity-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: identity-service
+      PORT: "8081"
+      SOS_OTP_DEV_CODE: "123456"
+      SOS_BOOTSTRAP_ADMIN_EMAIL: admin@societyos.in
+      SOS_BOOTSTRAP_ADMIN_PASSWORD: "ChangeMe!2026"
+      DB_URL: jdbc:postgresql://postgres:5432/identity_db
+      DB_USER: identity_app
+      DB_PASSWORD: identity_app
+      DB_OWNER_USER: identity_owner
+      DB_OWNER_PASSWORD: identity_owner
+    ports: ["18081:8081"]
+    volumes:
+      - ../../services/identity-service/target/identity-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  society-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: society-service
+      PORT: "8082"
+      DB_URL: jdbc:postgresql://postgres:5432/society_db
+      DB_USER: society_app
+      DB_PASSWORD: society_app
+      DB_OWNER_USER: society_owner
+      DB_OWNER_PASSWORD: society_owner
+    ports: ["18082:8082"]
+    volumes:
+      - ../../services/society-service/target/society-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  security-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: security-service
+      PORT: "8083"
+      DB_URL: jdbc:postgresql://postgres:5432/security_db
+      DB_USER: security_app
+      DB_PASSWORD: security_app
+      DB_OWNER_USER: security_owner
+      DB_OWNER_PASSWORD: security_owner
+    ports: ["18083:8083"]
+    volumes:
+      - ../../services/security-service/target/security-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  billing-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: billing-service
+      PORT: "8084"
+      DB_URL: jdbc:postgresql://postgres:5432/billing_db
+      DB_USER: billing_app
+      DB_PASSWORD: billing_app
+      DB_OWNER_USER: billing_owner
+      DB_OWNER_PASSWORD: billing_owner
+    ports: ["18084:8084"]
+    volumes:
+      - ../../services/billing-service/target/billing-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  asset-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: asset-service
+      PORT: "8085"
+      DB_URL: jdbc:postgresql://postgres:5432/asset_db
+      DB_USER: asset_app
+      DB_PASSWORD: asset_app
+      DB_OWNER_USER: asset_owner
+      DB_OWNER_PASSWORD: asset_owner
+    ports: ["18085:8085"]
+    volumes:
+      - ../../services/asset-service/target/asset-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  ticket-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: ticket-service
+      PORT: "8086"
+      DB_URL: jdbc:postgresql://postgres:5432/ticket_db
+      DB_USER: ticket_app
+      DB_PASSWORD: ticket_app
+      DB_OWNER_USER: ticket_owner
+      DB_OWNER_PASSWORD: ticket_owner
+    ports: ["18086:8086"]
+    volumes:
+      - ../../services/ticket-service/target/ticket-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  community-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: community-service
+      PORT: "8087"
+      DB_URL: jdbc:postgresql://postgres:5432/community_db
+      DB_USER: community_app
+      DB_PASSWORD: community_app
+      DB_OWNER_USER: community_owner
+      DB_OWNER_PASSWORD: community_owner
+    ports: ["18087:8087"]
+    volumes:
+      - ../../services/community-service/target/community-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  workflow-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: workflow-service
+      PORT: "8088"
+      DB_URL: jdbc:postgresql://postgres:5432/workflow_db
+      DB_USER: workflow_app
+      DB_PASSWORD: workflow_app
+      DB_OWNER_USER: workflow_owner
+      DB_OWNER_PASSWORD: workflow_owner
+      SPRING_FLYWAY_VALIDATE_ON_MIGRATE: "false"
+    ports: ["18088:8088"]
+    volumes:
+      - ../../services/workflow-service/target/workflow-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  notification-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: notification-service
+      PORT: "8089"
+      DB_URL: jdbc:postgresql://postgres:5432/notification_db
+      DB_USER: notification_app
+      DB_PASSWORD: notification_app
+      DB_OWNER_USER: notification_owner
+      DB_OWNER_PASSWORD: notification_owner
+      SMTP_HOST: mailpit
+    ports: ["18089:8089"]
+    volumes:
+      - ../../services/notification-service/target/notification-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  realtime-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: realtime-service
+      PORT: "8090"
+      DB_URL: jdbc:postgresql://postgres:5432/identity_db
+      DB_USER: identity_app
+      DB_PASSWORD: identity_app
+      DB_OWNER_USER: identity_owner
+      DB_OWNER_PASSWORD: identity_owner
+    ports: ["18090:8090"]
+    volumes:
+      - ../../services/realtime-service/target/realtime-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  media-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: media-service
+      PORT: "8091"
+      DB_URL: jdbc:postgresql://postgres:5432/media_db
+      DB_USER: media_app
+      DB_PASSWORD: media_app
+      DB_OWNER_USER: media_owner
+      DB_OWNER_PASSWORD: media_owner
+      SOS_MEDIA_S3_ENDPOINT: http://s3mock:9090
+    ports: ["18091:8091"]
+    volumes:
+      - ../../services/media-service/target/media-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  audit-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: audit-service
+      PORT: "8092"
+      DB_URL: jdbc:postgresql://postgres:5432/audit_db
+      DB_USER: audit_app
+      DB_PASSWORD: audit_app
+      DB_OWNER_USER: audit_owner
+      DB_OWNER_PASSWORD: audit_owner
+    ports: ["18092:8092"]
+    volumes:
+      - ../../services/audit-service/target/audit-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  dashboard-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: dashboard-service
+      PORT: "8093"
+      DB_URL: jdbc:postgresql://postgres:5432/dashboard_db
+      DB_USER: dashboard_app
+      DB_PASSWORD: dashboard_app
+      DB_OWNER_USER: dashboard_owner
+      DB_OWNER_PASSWORD: dashboard_owner
+    ports: ["18093:8093"]
+    volumes:
+      - ../../services/dashboard-service/target/dashboard-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  utility-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: utility-service
+      PORT: "8094"
+      DB_URL: jdbc:postgresql://postgres:5432/utility_db
+      DB_USER: utility_app
+      DB_PASSWORD: utility_app
+      DB_OWNER_USER: utility_owner
+      DB_OWNER_PASSWORD: utility_owner
+    ports: ["18094:8094"]
+    volumes:
+      - ../../services/utility-service/target/utility-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  vendor-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: vendor-service
+      PORT: "8095"
+      DB_URL: jdbc:postgresql://postgres:5432/vendor_db
+      DB_USER: vendor_app
+      DB_PASSWORD: vendor_app
+      DB_OWNER_USER: vendor_owner
+      DB_OWNER_PASSWORD: vendor_owner
+    ports: ["18095:8095"]
+    volumes:
+      - ../../services/vendor-service/target/vendor-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  compliance-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: compliance-service
+      PORT: "8096"
+      DB_URL: jdbc:postgresql://postgres:5432/compliance_db
+      DB_USER: compliance_app
+      DB_PASSWORD: compliance_app
+      DB_OWNER_USER: compliance_owner
+      DB_OWNER_PASSWORD: compliance_owner
+    ports: ["18096:8096"]
+    volumes:
+      - ../../services/compliance-service/target/compliance-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  marketplace-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: marketplace-service
+      PORT: "8098"
+      DB_URL: jdbc:postgresql://postgres:5432/marketplace_db
+      DB_USER: marketplace_app
+      DB_PASSWORD: marketplace_app
+      DB_OWNER_USER: marketplace_owner
+      DB_OWNER_PASSWORD: marketplace_owner
+    ports: ["18098:8098"]
+    volumes:
+      - ../../services/marketplace-service/target/marketplace-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+  inventory-service:
+    <<: *app-defaults
+    image: societyos-runtime:local
+    environment:
+      <<: *app-environment
+      SERVICE: inventory-service
+      PORT: "8099"
+      DB_URL: jdbc:postgresql://postgres:5432/inventory_db
+      DB_USER: inventory_app
+      DB_PASSWORD: inventory_app
+      DB_OWNER_USER: inventory_owner
+      DB_OWNER_PASSWORD: inventory_owner
+    ports: ["18099:8099"]
+    volumes:
+      - ../../services/inventory-service/target/inventory-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
+
+volumes:
+  pgdata:
+  minio:
+

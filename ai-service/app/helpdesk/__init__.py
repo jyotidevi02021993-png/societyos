@@ -102,7 +102,7 @@ class HelpdeskService:
             conversation_id = self._create_conversation(society_id, user_id)
 
         # Retrieve last 6 messages for context
-        history = self._get_recent_history(conversation_id)
+        history = self._get_recent_history(conversation_id, society_id)
 
         # Search KB for relevant chunks
         chunks: list[ChunkResult] = []
@@ -340,13 +340,15 @@ class HelpdeskService:
             )
         return conv_id
 
-    def _get_recent_history(self, conversation_id: uuid.UUID) -> list[dict]:
-        """Fetch last 6 messages from any society (used to build context prompt)."""
-        # We need to query without a specific society; use platform tenant for cross-read
-        # but the conversation_id filter is enough for correctness in practice.
-        # This is called just before the chat transaction so we do a separate read.
+    def _get_recent_history(self, conversation_id: uuid.UUID, society_id: uuid.UUID) -> list[dict]:
+        """Fetch last 6 messages for context building.
+
+        Uses Tenant.system(society_id) so RLS on conversation_message resolves correctly.
+        Tenant.platform() would set app.society_ids='{}' and silently return zero rows,
+        causing every response to be generated without any prior history (finding: history-rls-gap).
+        """
         try:
-            with self._db.tx(Tenant.platform()) as conn:
+            with self._db.tx(Tenant.system(society_id)) as conn:
                 rows = conn.execute(
                     """SELECT role, content_redacted FROM conversation_message
                        WHERE conversation_id = %s

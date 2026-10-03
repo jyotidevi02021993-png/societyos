@@ -1,0 +1,137 @@
+server:
+  port: ${PORT:8081}
+  shutdown: graceful
+
+spring:
+  application:
+    name: identity-service
+  config:
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  jackson:
+    default-property-inclusion: non_null
+
+  # PostgreSQL: runtime role is not the table owner, so row-level security applies
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/identity_db}
+    username: ${DB_USER:identity_app}
+    password: ${DB_PASSWORD:identity_app}
+    hikari:
+      maximum-pool-size: 10
+  flyway:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/identity_db}
+    user: ${DB_OWNER_USER:identity_owner}
+    password: ${DB_OWNER_PASSWORD:identity_owner}
+    locations: classpath:db/platform,classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate.jdbc.time_zone: UTC
+
+  # Kafka: CloudEvents JSON as strings; offsets committed after the DB commit
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  cloud:
+    config:
+      fail-fast: false
+    openfeign:
+      circuitbreaker:
+        enabled: true
+      client:
+        config:
+          default:
+            connect-timeout: 2000
+            read-timeout: 5000
+
+# Service registry
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 10
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    correlation: "[%X{traceId:-}] [%X{societyId:-}] "
+
+sos:
+  default-timezone: Asia/Kolkata
+  outbox:
+    # debezium (Kafka Connect reads the WAL) or polling (built-in relay, no Connect needed)
+    relay: ${SOS_OUTBOX_RELAY:debezium}
+  security:
+    issuer: ${SOS_ISSUER:https://auth.societyos.in}
+    public-paths:
+      - /v1/auth/otp/**
+      - /v1/auth/login
+      - /v1/auth/token/refresh
+      - /v1/auth/service-token
+      - /.well-known/jwks.json
+  identity:
+    issuer: ${SOS_ISSUER:https://auth.societyos.in}
+    access-token-ttl: 15m
+    refresh-token-ttl: 30d
+    otp:
+      ttl: 5m
+      max-attempts: 5
+      max-requests-per-window: 3
+      request-window: 15m
+      # Local/dev only: a fixed code instead of SMS. Never set in staging/prod.
+      dev-code: ${SOS_OTP_DEV_CODE:}
+    bootstrap-admin:
+      email: ${SOS_BOOTSTRAP_ADMIN_EMAIL:}
+      password: ${SOS_BOOTSTRAP_ADMIN_PASSWORD:}
+      name: Platform Admin
+    # Service clients (client credentials). The local secret for notification-service is
+    # "notification-local-dev-secret"; staging/prod inject the SHA-256 of a real secret.
+    service-clients:
+      notification-service:
+        secret-sha256: ${SOS_NOTIFICATION_CLIENT_SECRET_SHA256:23b8ddb1dfe0ff2149a970cf2bbce67109c63cadfc01d92a95463bed097ad853}
+        scopes: [users:contact]

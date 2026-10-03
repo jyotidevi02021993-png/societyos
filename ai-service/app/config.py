@@ -37,13 +37,11 @@ class Settings(BaseSettings):
     jwks_uri: str = Field("http://localhost:8081/.well-known/jwks.json", alias="SOS_JWKS_URI")
     identity_url: str = Field("http://localhost:8081", alias="IDENTITY_URL")
     permission_cache_seconds: int = Field(300, alias="SOS_PERMISSION_CACHE_SECONDS")
-    # Expected JWT audience. Set to the service name (e.g. "ai-service") or leave empty to
-    # skip audience validation.  In deployments where all services share one JWKS endpoint,
-    # setting this prevents tokens issued for another service from being accepted here.
+    # Expected JWT audience.  Set to the service name (e.g. "ai-service") to require that
+    # tokens carry a matching 'aud' claim — recommended in multi-service deployments sharing
+    # one JWKS endpoint.  Leave unset (None) to skip audience validation — acceptable in
+    # single-service or dev environments where the JWKS endpoint is private.
     jwt_audience: str | None = Field(None, alias="SOS_JWT_AUDIENCE")
-    # Expected JWT audience claim.  Set to the empty string to disable audience validation
-    # (acceptable only in single-service dev environments where the JWKS endpoint is private).
-    jwt_audience: str = Field("ai-service", alias="SOS_JWT_AUDIENCE")
 
     # LLM gateway
     llm_provider: str = Field("anthropic", alias="LLM_PROVIDER")  # anthropic | fake

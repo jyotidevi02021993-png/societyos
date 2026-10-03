@@ -1,0 +1,9 @@
+sos:
+  outbox:
+    polling-interval: 100
+  scheduler:
+    polling-interval: 1s
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

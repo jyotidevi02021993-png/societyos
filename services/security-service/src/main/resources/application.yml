@@ -1,0 +1,135 @@
+server:
+  port: ${PORT:8083}
+  shutdown: graceful
+
+spring:
+  application:
+    name: security-service
+  config:
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  jackson:
+    default-property-inclusion: non_null
+
+  # PostgreSQL: runtime role is not the table owner, so row-level security applies
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/security_db}
+    username: ${DB_USER:security_app}
+    password: ${DB_PASSWORD:security_app}
+    hikari:
+      maximum-pool-size: 10
+  flyway:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/security_db}
+    user: ${DB_OWNER_USER:security_owner}
+    password: ${DB_OWNER_PASSWORD:security_owner}
+    locations: classpath:db/platform,classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate.jdbc.time_zone: UTC
+
+  # Kafka: CloudEvents JSON as strings; offsets committed after the DB commit
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+  cloud:
+    config:
+      fail-fast: false
+    # Also in config-repo, but repeated here so it holds when config-server is not reachable at boot:
+    # TenantContext is a ThreadLocal, so a time-limiter pool thread would call without Authorization.
+    circuitbreaker:
+      resilience4j:
+        disable-thread-pool: true
+    openfeign:
+      circuitbreaker:
+        enabled: true
+      client:
+        config:
+          default:
+            connect-timeout: 2000
+            read-timeout: 5000
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+  instance:
+    prefer-ip-address: true
+    lease-renewal-interval-in-seconds: 10
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 6s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    correlation: "[%X{traceId:-}] [%X{societyId:-}] "
+
+sos:
+  default-timezone: Asia/Kolkata
+  # Gate defaults; per-society gateApprovalTimeoutSeconds / visitorRetentionDays arrive with
+  # society.settings.updated and win over these.
+  gate:
+    approval-timeout: 120s
+    retention-days: 180
+    max-pass-validity: 31d
+    max-pass-uses: 50
+    expiry-poll: 5s                     # db-scheduler: how often timed-out requests are expired
+    retention-cron: "0 30 2 * * *"      # nightly retention purge, in sos.default-timezone
+  scheduler:
+    enabled: true
+  outbox:
+    # debezium (Kafka Connect reads the WAL) or polling (built-in relay, no Connect needed)
+    relay: ${SOS_OUTBOX_RELAY:debezium}
+  security:
+    issuer: ${SOS_ISSUER:https://auth.societyos.in}
+    jwks-uri: ${SOS_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    public-paths: []
+  crypto:
+    # DEVELOPMENT KEYS ONLY. Staging/prod inject KMS-backed keys through Secrets Manager.
+    field-key: ${SOS_FIELD_KEY:c29jaWV0eW9zLWxvY2FsLWRldi1maWVsZC1rZXktMzI=}
+    hash-key: ${SOS_HASH_KEY:c29jaWV0eW9zLWxvY2FsLWRldi1oYXNoLWtleQ==}

@@ -1,0 +1,4 @@
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

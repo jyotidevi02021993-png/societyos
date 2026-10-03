@@ -1,0 +1,18 @@
+# Shared by every service (Spring Cloud Config "application" file).
+# Platform defaults live in platform-starter; override here per environment, not in code.
+sos:
+  security:
+    issuer: ${SOS_ISSUER:https://auth.societyos.in}
+  default-timezone: Asia/Kolkata
+
+# Run Feign circuit-breaker calls on the calling thread: TenantContext (bearer token, society)
+# is a ThreadLocal, so a time-limiter pool thread would forward calls without Authorization.
+spring:
+  cloud:
+    circuitbreaker:
+      resilience4j:
+        disable-thread-pool: true
+
+logging:
+  level:
+    in.societyos: INFO

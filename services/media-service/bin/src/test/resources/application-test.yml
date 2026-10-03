@@ -1,0 +1,10 @@
+sos:
+  outbox:
+    polling-interval: 100
+  media:
+    create-bucket: false
+    process-poll: 1s
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

@@ -1,0 +1,1 @@
+-- TEMPLATE: the service's own schema starts at V1. Platform migrations (V0_x) are in db/platform.

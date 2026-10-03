@@ -1,0 +1,33 @@
+.gradle/
+.mvn/wrapper/maven-wrapper.jar
+target/
+.maven-home/
+.run-logs/
+**/hs_err_pid*.log
+**/replay_pid*.log
+build/
+!gradle/wrapper/gradle-wrapper.jar
+out/
+.idea/
+*.iml
+.vscode/
+*.log
+.env
+.env.local
+
+# Node / Next.js
+node_modules/
+.next/
+.turbo/
+dist/
+coverage/
+
+# Flutter
+apps/mobile/.dart_tool/
+apps/mobile/build/
+apps/mobile/.flutter-plugins*
+
+# Python
+__pycache__/
+.venv/
+.pytest_cache/

@@ -1,0 +1,38 @@
+{
+  "name": "societyos-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SocietyOS web portals (admin-web, resident-web) and shared packages",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20.9"
+  },
+  "scripts": {
+    "dev:admin": "npm run dev -w @societyos/admin-web",
+    "dev:resident": "npm run dev -w @societyos/resident-web",
+    "build": "npm run build -w @societyos/admin-web && npm run build -w @societyos/resident-web",
+    "build:admin": "npm run build -w @societyos/admin-web",
+    "build:resident": "npm run build -w @societyos/resident-web",
+    "start:admin": "npm run start -w @societyos/admin-web",
+    "start:resident": "npm run start -w @societyos/resident-web",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

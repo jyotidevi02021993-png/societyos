@@ -1,0 +1,29 @@
+server:
+  port: ${PORT:8761}
+
+spring:
+  application:
+    name: service-registry
+
+eureka:
+  instance:
+    hostname: ${EUREKA_HOSTNAME:localhost}
+  client:
+    # Standalone locally; in staging/prod run 2-3 replicas that peer with each other
+    register-with-eureka: ${EUREKA_PEER_AWARE:false}
+    fetch-registry: ${EUREKA_PEER_AWARE:false}
+    service-url:
+      defaultZone: ${EUREKA_PEERS:http://${eureka.instance.hostname}:${server.port}/eureka}
+  server:
+    enable-self-preservation: ${EUREKA_SELF_PRESERVATION:false}
+    eviction-interval-timer-in-ms: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true

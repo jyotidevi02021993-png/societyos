@@ -1,0 +1,14 @@
+sos:
+  identity:
+    otp:
+      dev-code: "123456"
+      max-requests-per-window: 50
+  events:
+    listener-concurrency: 1
+  outbox:
+    polling-interval: 100
+
+logging:
+  level:
+    in.societyos: DEBUG
+    org.apache.kafka: WARN

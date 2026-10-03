@@ -1,0 +1,294 @@
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-gateway
+  config:
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  cloud:
+    config:
+      fail-fast: false
+    gateway:
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: 2000
+            response-timeout: 15s
+          default-filters:
+            - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_UNIQUE
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@userKeyResolver}"
+          routes:
+            # Service-only endpoints (/v1/internal/**) are never reachable from outside
+            - id: block-internal
+              uri: no://op
+              order: -100
+              predicates:
+                - Path=/api/*/v1/internal/**
+              filters:
+                - SetStatus=404
+            - id: identity-otp
+              uri: lb://identity-service
+              order: -10
+              predicates:
+                - Path=/api/identity/v1/auth/otp/**
+              filters:
+                - StripPrefix=2
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter.replenishRate: 1
+                    redis-rate-limiter.burstCapacity: 5
+                    redis-rate-limiter.requestedTokens: 1
+                    key-resolver: "#{@ipKeyResolver}"
+                    deny-empty-key: true
+                - name: CircuitBreaker
+                  args:
+                    name: identity
+                    fallbackUri: forward:/fallback/identity-service
+            - id: jwks
+              uri: lb://identity-service
+              predicates:
+                - Path=/.well-known/jwks.json
+            - id: realtime-ws
+              uri: lb:ws://realtime-service
+              predicates:
+                - Path=/ws/**
+            - id: identity
+              uri: lb://identity-service
+              predicates:
+                - Path=/api/identity/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: identity
+                    fallbackUri: forward:/fallback/identity-service
+            - id: society
+              uri: lb://society-service
+              predicates:
+                - Path=/api/society/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: society
+                    fallbackUri: forward:/fallback/society-service
+            - id: security
+              uri: lb://security-service
+              predicates:
+                - Path=/api/security/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: security
+                    fallbackUri: forward:/fallback/security-service
+            - id: billing
+              uri: lb://billing-service
+              predicates:
+                - Path=/api/billing/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: billing
+                    fallbackUri: forward:/fallback/billing-service
+            - id: community
+              uri: lb://community-service
+              predicates:
+                - Path=/api/community/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: community
+                    fallbackUri: forward:/fallback/community-service
+            - id: ticket
+              uri: lb://ticket-service
+              predicates:
+                - Path=/api/ticket/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: ticket
+                    fallbackUri: forward:/fallback/ticket-service
+            - id: asset
+              uri: lb://asset-service
+              predicates:
+                - Path=/api/asset/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: asset
+                    fallbackUri: forward:/fallback/asset-service
+            - id: utility
+              uri: lb://utility-service
+              predicates:
+                - Path=/api/utility/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: utility
+                    fallbackUri: forward:/fallback/utility-service
+            - id: vendor
+              uri: lb://vendor-service
+              predicates:
+                - Path=/api/vendor/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: vendor
+                    fallbackUri: forward:/fallback/vendor-service
+            - id: inventory
+              uri: lb://inventory-service
+              predicates:
+                - Path=/api/inventory/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: inventory
+                    fallbackUri: forward:/fallback/inventory-service
+            - id: compliance
+              uri: lb://compliance-service
+              predicates:
+                - Path=/api/compliance/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: compliance
+                    fallbackUri: forward:/fallback/compliance-service
+            - id: notification
+              uri: lb://notification-service
+              predicates:
+                - Path=/api/notification/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: notification
+                    fallbackUri: forward:/fallback/notification-service
+            - id: workflow
+              uri: lb://workflow-service
+              predicates:
+                - Path=/api/workflow/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: workflow
+                    fallbackUri: forward:/fallback/workflow-service
+            - id: audit
+              uri: lb://audit-service
+              predicates:
+                - Path=/api/audit/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: audit
+                    fallbackUri: forward:/fallback/audit-service
+            - id: media
+              uri: lb://media-service
+              predicates:
+                - Path=/api/media/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: media
+                    fallbackUri: forward:/fallback/media-service
+            - id: dashboard
+              uri: lb://dashboard-service
+              predicates:
+                - Path=/api/dashboard/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: dashboard
+                    fallbackUri: forward:/fallback/dashboard-service
+            - id: ai
+              uri: lb://ai-service
+              predicates:
+                - Path=/api/ai/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: ai
+                    fallbackUri: forward:/fallback/ai-service
+            - id: marketplace
+              uri: lb://marketplace-service
+              predicates:
+                - Path=/api/marketplace/**
+              filters:
+                - StripPrefix=2
+                - name: CircuitBreaker
+                  args:
+                    name: marketplace
+                    fallbackUri: forward:/fallback/marketplace-service
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+# Paths reachable without a token; everything else needs a valid JWT
+sos:
+  gateway:
+    issuer: ${SOS_ISSUER:https://auth.societyos.in}
+    jwks-uri: ${SOS_JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    public-paths:
+      - /api/identity/v1/auth/**
+      - /.well-known/jwks.json
+      - /api/billing/v1/webhooks/**
+      - /api/security/v1/public/**
+      - /ws/**
+    allowed-origins:
+      - ${ADMIN_WEB_ORIGIN:http://localhost:3000}
+      - ${RESIDENT_WEB_ORIGIN:http://localhost:3001}
+
+# Default Resilience4j settings for every route's circuit breaker
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 15s
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+    registry-fetch-interval-seconds: 5
+  instance:
+    prefer-ip-address: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,gateway
+  endpoint:
+    health:
+      probes:
+        enabled: true

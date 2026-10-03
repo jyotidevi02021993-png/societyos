@@ -1,0 +1,24 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": "duplicate-jwt-audience",
+      "severity": "blocking",
+      "summary": "Duplicate `jwt_audience` field in config.py. The second definition (Field('ai-service', ...)) silently overrides the first (Field(None, ...)), making audience validation non-optional and breaking deployments that intentionally omit SOS_JWT_AUDIENCE. The opt-out branch in _decode_token is unreachable.",
+      "action": "Remove the first (nullable) definition. Keep the second with default 'ai-service' and update docs, or keep the first with default None and remove the second — whichever matches deployment intent."
+    },
+    {
+      "id": "triage-inbox-triage-split",
+      "severity": "blocking",
+      "summary": "TriageService._handle_message() commits the inbox_event INSERT in Tx A, then calls triage_complaint() in Tx B. A crash between them permanently marks the event as processed while skipping the triage_suggestion write. Complaints processed during that window receive no AI classification.",
+      "action": "Inline the idempotency INSERT into the same transaction as the triage_suggestion upsert and domain event publish, after the LLM call (which must remain outside any transaction). Matches the pattern already used by knowledge and estate consumers."
+    },
+    {
+      "id": "history-rls-gap",
+      "severity": "blocking",
+      "summary": "_get_recent_history() uses Tenant.platform() which sets app.society_ids='{}'. RLS on conversation_message filters out all rows silently, causing every helpdesk response to be generated without conversation history.",
+      "action": "Replace Tenant.platform() with Tenant.system(society_id), passing the active society_id through from the chat() caller."
+    }
+  ],
+  "reviewDoc": "e:\\socity app\\societyos\\ai-service\\.agents\\tasks\\code-review.md"
+}

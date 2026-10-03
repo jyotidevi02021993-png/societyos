@@ -406,29 +406,105 @@ class TriageService:
         except ValueError:
             return
 
-        # Idempotency
-        with self._db.tx(Tenant.system(society_id)) as conn:
-            result = conn.execute(
-                "INSERT INTO inbox_event (consumer, event_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                ('ai-triage', event_id),
-            )
-            if result.rowcount == 0:
-                return
-
-        # Run triage in the thread's event loop context
+        # Run triage in the thread's event loop context.
+        # The LLM call (network I/O) must happen OUTSIDE the DB transaction, so we
+        # perform it first.  The idempotency INSERT (inbox_event) and the
+        # triage_suggestion upsert then land in the SAME transaction — matching the
+        # pattern used by knowledge and estate consumers — so a crash between them
+        # cannot permanently mark an event as processed while skipping the suggestion.
         try:
             loop = asyncio.new_event_loop()
             loop.run_until_complete(
-                self.triage_complaint(
+                self._triage_with_idempotency(
                     society_id=society_id,
                     complaint_id=complaint_id,
                     text=complaint_text,
+                    event_id=event_id,
                 )
             )
         except Exception:
             log.exception('Triage failed for complaint %s', complaint_id_str)
         finally:
             loop.close()
+
+    async def _triage_with_idempotency(
+        self,
+        *,
+        society_id: uuid.UUID,
+        complaint_id: uuid.UUID,
+        text: str,
+        event_id: str,
+    ) -> None:
+        """Run LLM triage (outside DB tx), then atomically write inbox_event +
+        triage_suggestion in a single transaction.  If the inbox INSERT is a duplicate
+        (conflict → rowcount 0) the whole transaction rolls back and we skip the event.
+        """
+        # 1. Load categories and run LLM (outside any transaction)
+        categories = self._load_categories(society_id)
+        if not categories:
+            categories = list(_DEFAULT_CATEGORIES)
+
+        method = 'RULES'
+        triage: dict | None = None
+        try:
+            triage = await self._llm_triage(society_id, text, categories)
+            if triage and triage.get('confidence', 0) >= 0.4:
+                method = 'LLM'
+            else:
+                triage = None
+        except Exception:
+            triage = None
+
+        if triage is None:
+            triage = self._rules_triage(text, categories)
+            method = 'RULES'
+
+        category_name = triage['category']
+        department = triage['department']
+        priority = triage['priority']
+        confidence = float(triage.get('confidence', 1.0 if method == 'RULES' else 0.85))
+        suggestion_id = uuid7()
+
+        # 2. Single transaction: idempotency check + upsert + event publish
+        with self._db.tx(Tenant.system(society_id)) as conn:
+            result = conn.execute(
+                "INSERT INTO inbox_event (consumer, event_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                ('ai-triage', event_id),
+            )
+            if result.rowcount == 0:
+                return  # already processed — skip everything
+
+            conn.execute(
+                """INSERT INTO triage_suggestion
+                   (id, society_id, complaint_id, category_name, department, priority, confidence, method)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (society_id, complaint_id) DO UPDATE
+                   SET category_name = EXCLUDED.category_name,
+                       department    = EXCLUDED.department,
+                       priority      = EXCLUDED.priority,
+                       confidence    = EXCLUDED.confidence,
+                       method        = EXCLUDED.method,
+                       updated_at    = now()""",
+                (suggestion_id, society_id, complaint_id,
+                 category_name, department, priority, confidence, method),
+            )
+
+            if confidence >= self._settings.triage_auto_apply_threshold:
+                publish(
+                    conn,
+                    DomainEvent(
+                        type='ai.classification.suggested',
+                        aggregate_id=complaint_id,
+                        data={
+                            'complaintId': str(complaint_id),
+                            'categoryName': category_name,
+                            'department': department,
+                            'priority': priority,
+                            'confidence': confidence,
+                            'method': method,
+                        },
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------
