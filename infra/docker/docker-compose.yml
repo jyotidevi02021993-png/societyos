@@ -233,8 +233,10 @@ services:
   society-service:
     <<: *app-defaults
     image: societyos-runtime:local
+    mem_limit: 768m
     environment:
       <<: *app-environment
+      JAVA_TOOL_OPTIONS: "-Xms32m -Xmx384m -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=64m -Xss512k"
       SERVICE: society-service
       PORT: "8082"
       DB_URL: jdbc:postgresql://postgres:5432/society_db
