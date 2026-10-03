@@ -505,6 +505,39 @@ services:
     volumes:
       - ../../services/inventory-service/target/inventory-service-0.1.0-SNAPSHOT.jar:/opt/app/app.jar:ro
 
+  ai-service:
+    build:
+      context: ../../ai-service
+      dockerfile: Dockerfile
+    image: societyos-ai-service:local
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      PORT: "8097"
+      DB_URL: postgresql://ai_app:ai_app@postgres:5432/ai_db
+      DB_OWNER_URL: postgresql://ai_owner:ai_owner@postgres:5432/ai_db
+      KAFKA_BOOTSTRAP: kafka:29092
+      SOS_KAFKA_ENABLED: "true"
+      SOS_OUTBOX_RELAY: polling
+      SOS_ISSUER: https://auth.societyos.in
+      SOS_JWKS_URI: http://identity-service:8081/.well-known/jwks.json
+      IDENTITY_URL: http://identity-service:8081
+      LLM_PROVIDER: fake
+      EMBEDDINGS_PROVIDER: hashing
+      SOS_RUN_MIGRATIONS: "true"
+    ports: ["18097:8097"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8097/actuator/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
 volumes:
   pgdata:
   minio:
