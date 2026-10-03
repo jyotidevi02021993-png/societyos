@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn[standard]==0.54.0
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
+pydantic-settings==2.15.0
+anthropic==1.8.0
+pyjwt[cryptography]==2.15.0
+confluent-kafka==2.15.1
+# sentence-transformers is optional (not installed in current venv)
+# sentence-transformers>=2.0.0
